@@ -1,0 +1,338 @@
+---
+title: "GEM 520 Lab 6 - Supervised Image Classification"
+author: Wendi Zhang
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  pdf_document: 
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if(!dir.exists("outputs")) dir.create("outputs", showWarnings = FALSE)
+```
+
+The R code to analyze the polygons that you have delineated, split the data into training and validation sets, classify the image with the Maximum Likelihood algorithm and generate the confusion matrix is provided. You just need to set the file path to your `classification_polygons_YourInitials.shp` at the beginning of PART 3. 
+
+However, you will have to type your own code [here](#code-answer) to calculate the overall accuracy, user accuracy and producer accuracy from the confusion matrix. **Note that the overall accuracy must be more than 75% to receive full marks**. 
+
+Make also sure to answer [Q1](#Q1), [Q2](#Q2), [Q3](#Q3), [Q4](#Q4) and [Q5](#Q5) in your R Markdown report. 
+
+**This document reads in the Landsat imagery and the delineated polygons with relative file paths from the root directory of the lab folder, where the Rmd file is located. Make sure that `classification_polygons_YourInitials` files are stored in the `outputs` folder and that your Rmd file is located at the root of the directory**
+
+## PART 1 - Supervised Classification
+
+***See PDF***
+
+## PART 2 - Defining areas of training data 
+
+***See PDF***
+
+## PART 3 - Image classification and accuracy assessment
+
+**SET THE FILE NAME OF YOUR `classification_polygons_YourInital.shp` file in the following code chunk**
+
+```{r}
+my_polygons <- "C:\\Users\\wendiz3.stu\\OneDrive - UBC\\Documents\\GEM 520 Remote Sensing & R\\Labs\\Lab 6_Spectral Signature and Image Classification\\classification_polygons_WZ.shp"
+```
+
+The following packages need to be installed on your machine. *DO NOT install the packages in the R Markdown document. Run the install.packages() commands in the console, in a fresh and clean R Studio session*
+
+```{r, eval = FALSE}
+# install.packages('terra', repos='https://rspatial.r-universe.dev')
+# install.packages("raster")
+# install.packages("sf")
+# install.packages("RStoolbox")
+# install.packages("tidyverse")
+# install.packages("caret")
+```
+
+Once installed, we attach the packages 
+
+```{r, message=FALSE}
+library(tidyverse)
+library(terra)
+library(sf)
+library(RStoolbox)
+```
+
+We start by reading the Landsat image into R
+
+```{r}
+ls_image <- rast("C:\\Users\\wendiz3.stu\\OneDrive - UBC\\Documents\\GEM 520 Remote Sensing & R\\Labs\\Lab 6_Spectral Signature and Image Classification\\Data\\LT05_L2SP_20060723_GulfIslands_BSTACK.tif")
+
+ls_image
+
+terra::plotRGB(ls_image, r = 3, g = 2, b = 1, stretch = "lin")
+```
+
+Then, we load the delineated polygons
+
+```{r}
+class_poly <- st_read(my_polygons)
+
+# Make sure that the geometry is valid
+class_poly <- st_make_valid(class_poly)
+
+# Tranform lc_class to factor
+class_poly <- class_poly %>%
+  mutate(lc_class = factor(lc_class, 
+                           levels = c("Broadleaf Forest", "Coniferous Forest", "Exposed soil and rocks", "High density developed", "Low density developed", "Non-forest vegetation", "Water")))
+
+# Plot
+terra::plotRGB(ls_image, r = 3, g = 2, b = 1, stretch = "lin")
+plot(class_poly[, "lc_class"], add = TRUE)
+```
+
+Here is a summary of the number of polygons per class
+
+```{r}
+poly_summary <- class_poly %>%
+  st_drop_geometry() %>%
+  group_by(lc_class) %>%
+  summarize(n_poly = n())
+
+poly_summary
+```
+
+For each land cover class will use 70% of the polygons to train the classification algorithm and the remaining 30% for validation. 
+
+```{r}
+# Assign a unique ID to each polygon 
+class_poly <- tibble::rowid_to_column(class_poly, var = "ID")
+
+set.seed(1234)
+
+# Sample 70% of the polygons in each land cover class
+poly_train <- class_poly %>%
+  group_by(lc_class) %>%
+  sample_frac(0.7) %>%
+  mutate(set = "training") %>% st_cast(to = 'POLYGON')
+
+# Use the ID field to select the polygons for validation
+poly_val <- class_poly %>%
+  filter(!ID %in% poly_train$ID) %>%
+  mutate(set = "validation") %>% st_cast(to = 'POLYGON')
+
+poly_set <- rbind(poly_train, 
+                  poly_val)
+
+# Plot poly_set
+plot(poly_set[, "set"])
+```
+
+We now extract the values of the Landsat image pixels in the polygons
+
+```{r}
+poly_set_vals <- terra::extract(ls_image, vect(poly_set))
+
+# We need to perform an inner_join to retrieve lc_class
+poly_set_vals <- inner_join(poly_set, poly_set_vals) %>%
+  st_drop_geometry()
+```
+
+Each row of `poly_set_vals` corresponds to one pixel of the Landsat image.
+
+```{r}
+poly_set_vals
+```
+
+We can check the number of pixels per class and training / validation set
+
+```{r}
+poly_stats <- poly_set_vals %>%
+  group_by(set, lc_class) %>%
+  summarize(n_px = n())
+
+poly_stats
+```
+
+We can pivot the data from a wide to long format 
+
+```{r}
+poly_set_vals_long <- pivot_longer(poly_set_vals,
+                                   blue:swir2, 
+                                   names_to = "band", 
+                                   values_to = "reflectance")
+
+poly_set_vals_long
+```
+
+And calculate some summary statistics for each band and land cover class: mean, 5^th^ quantile and 95^th^ quantile of reflectance. 
+
+```{r}
+spectral_sign <- poly_set_vals_long %>%
+  group_by(lc_class, band) %>%
+  summarize(r_mean = mean(reflectance, na.rm = TRUE), 
+            r_q05 = quantile(reflectance, 0.05, na.rm = TRUE), 
+            r_q95 = quantile(reflectance, 0.95, na.rm = TRUE))
+
+spectral_sign
+```
+
+We can now visualize the spectral signature of each land cover class
+
+```{r}
+# Wavelength corresponding to each band
+bands_wavelength <- read_csv("C:\\Users\\wendiz3.stu\\OneDrive - UBC\\Documents\\GEM 520 Remote Sensing & R\\Labs\\Lab 6_Spectral Signature and Image Classification\\Data\\bands_wavelength.csv")
+
+bands_wavelength
+
+# Join wavelength
+spectral_sign <- inner_join(spectral_sign, bands_wavelength)
+
+# Graph
+ggplot(spectral_sign, aes(x = wavelength, y = r_mean, group = 1)) +
+  geom_point() + 
+  geom_line() + 
+  geom_ribbon(aes(ymin = r_q05, ymax = r_q95), alpha = 0.2) + 
+  facet_wrap(vars(lc_class)) + 
+  theme_bw() + 
+  labs(x = "Wavelength (nm)", 
+       y = "Reflectance")
+```
+
+We can now use the function `superClass()` from the `RSToolbox` package to perform the classification and accuracy assessment. The argument `model = "mlc"` is used to select the Maximum Likelihood algorithm for classification. We provide the polygons used for training and validation under the arguments `trainData` and `valData`. The function will sample `500` pixels from the training polygons (argument `nSamples = 500`) per land cover class and use this sample to train the classification algorithm. Similarly, validation will be performed on a sample of `500` pixels of the validation polygons per land cover class. Note that for some classes there might not be enough pixels to reach `500` observations. In that case, training / validation would be performed on \< `500` pixels per land cover class. It is important to try to balance the number of observation per classes before training the classification model and assessing its accuracy. Otherwise, the overall accuracy derived from the confusion matrix could be biased towards the classes with the largest number of observations.
+
+For example, it is easier to draw large polygons across water (and hence getting a lot of training/validation data) than it is over broadleaf forest. Let's assume that we use 1000 pixels to assess the accuracy of water and 20 pixels to assess the accuracy of broadleaf vegetation. For water, 900 out of 1000 pixels (90%) were classified correctly whereas only 5 out of 20 pixels were classified correctly for broadleaf.
+
+The overall accuracy would be: 
+
+```{r}
+OA_unbalanced <- (900 + 5) / (1000 + 20)
+
+OA_unbalanced
+```
+
+Now let's assume that 20 pixels were used for both water and broadleaf to assess the classification accuracy. For water, 18 out of 20 pixels (still 90%) were classified correctly and 5 out of 20 pixels were classified correctly for broadleaf. 
+
+The overall accuracy would be: 
+
+```{r}
+OA_balanced <- (18 + 5) / (20 + 20)
+
+OA_balanced
+```
+
+In the first case where classes are unbalanced we obtain an overall accuracy of `r round(OA_unbalanced, 2) * 100`%.  Because there are much more pixels in water than in broafleaf in the first case, the overall accuracy is very high and doesn't reflect the fact that the broadleaf class is poorly classified. In the second case, where classes are balanced, we obtain an overall accuracy of `r round(OA_balanced, 2) * 100`%. This illustrates that the classification is not as good as we might think with the first case. 
+
+*The superClass() function might take a few minutes to run*
+
+```{r}
+# original code: 
+
+set.seed(1234)
+
+poly_train <- poly_train %>% rename(class = lc_class)
+poly_val <- poly_val %>% rename(class = lc_class)
+
+mlc_model <- superClass(img = raster::stack(ls_image), 
+                        trainData = as(poly_train, "Spatial"), 
+                        valData = as(poly_val, "Spatial"), 
+                        responseCol = "class", 
+                        model = "mlc", 
+                        nSamples = 500)
+
+```
+
+The `superClass()` function returns a list with multiple objects. The classified map is stored in the element of the list called `map`.  The trained model is stored in the element `model`. The predictions of the model at the validation data are stored in a data.frame called `validationSamples` located in the element of `mlc_model` called `validation`. The column `reference` is the land cover class that you have assigned and the column `prediction` is the land cover class predicted by the model. 
+
+```{r}
+classified_map <- mlc_model$map
+
+# Write the classified map as a tif file
+raster::writeRaster(classified_map, 
+            filename = "outputs/classified_map.tif", 
+            overwrite = TRUE)
+
+# Plot with colors
+raster::plot(classified_map,
+     col = c('#A6D96A','#33A02C','#DE3B13','#D63CF1','#00D2D2','#F1A026','#2B83BA'),
+     main = "Gulf Islands Land Cover Classification Map")
+
+# Validation df
+val_preds <- mlc_model$validation$validationSamples
+
+head(val_preds)
+```
+
+The confusion matrix can be created from `val_preds` using the `table()` function (base R package). The columns represent the reference classes (classes you have assigned) and the rows represent the predictions of the model. 
+
+```{r}
+conf_matrix <- table(st_drop_geometry(val_preds[, c("prediction", "reference")]))
+
+knitr::kable(conf_matrix)
+```
+
+The `table()` function returns a `matrix` object with the predicted classes in the rows and the reference classes in the columns. The diagonal of a matrix can be returned as a `vector` using the `diag()` function. The row and column sums can be returned with the `rowSums()` and `colSums()` functions. The sum of all elements of a matrix can be obtained with the `sum()` function. 
+
+Use the functions described above to calculate the overall accuracy (`OA`), producer accuracy (`PA`) and user accuracy (`UA`) of your classification. 
+
+**Note that the overall accuracy must be more than 75% to receive full marks**
+
+### Code answer {#code-answer}
+
+```{r}
+# Calculate accuracy metrics here
+
+col_sum <- sum(colSums(conf_matrix))
+col_sum
+
+row_sum <- sum(rowSums(conf_matrix))
+row_sum
+
+diagnal_sum <- sum(diag(conf_matrix))
+diagnal_sum
+
+OA <- diagnal_sum/col_sum * 100
+OA
+
+#predicted classes in the rows
+#reference classes in the columns
+
+UA <- diag(conf_matrix)/rowSums(conf_matrix)
+UA
+
+PA <- diag(conf_matrix)/colSums(conf_matrix)
+PA
+
+#write a neat confusion metric
+
+confusion_metrix <- data.frame(OA, UA, PA)
+
+```
+
+***Answer the following questions in brief answers (1-5 lines each)***
+
+### Question 1 {#Q1}
+
+**What is a supervised classification process and how does it differs from unsupervised classification?**
+A supervised classification process involves using training data to group spectral classes that have similar pixel values in several spectral bands and assigning them with the same categorical class names as the training data the pixels are similar to.
+
+An unsupervised classification process does not involves choosing training areas and generating validation data. It uses land classification algorithm to assign pixels into one of the user-specified classes. Interpreters assign each of the groupings of pixels a value corresponding to a land cover class.   
+
+### Question 2 {#Q2}
+
+**Why do we need distinct training and validation data, and why is important they do not overlap?**
+We need distinct training data because training data is the reference that is used by the algorithm to classify the imagery. It's important that they don't overlap because validation data is meant to be additional data to validate the accuracy of the classification.
+
+### Question 3 {#Q3}
+
+**How does Maximum Likelihood classification work?**
+Maximum likelihood classification algorithm uses the mean and variance of the pixel within the training areas. It requires the data to be normally distributed. Therefore, the maximum likelihood classification is also called a Gaussian classification. It classifies the land cover based on the probability of the pixels belong to one class. 
+
+### Question 4 {#Q4}
+
+**Which classes achieved the worst producer and user accuracies, why do you think this is?**
+High density urban area achieved the worst producer accuracy.Low density urban area achieved the worst user accuracy. These two classes are difficult to be distinguished from each other and other classes such as exposed soil and rocks because the spectral reflectance are similar. Developed urban areas contain many types of landscape features, which make the classification more challenging.   
+
+### Question 5 {#Q5}
+
+**Which classes achieved the best results, why do you think this is?**
+Water achieved the best result because it is a very uniform land cover type with little variations in spectral response from place to place. There's little to no noise on or in water to influence the identification of water from other landscape features. Water occupies a large area on the imagery, so it's easy to create accurate and more wide-distributed training data
+
+## Part 4 - Classification Examination 
+
+Now, load the classified map `outputs/classified_map.tif` back into QGIS. Navigate around the classified image and compare it to the original image. Ask yourself: was this a successful classification? Does the distribution of classes make sense? Are there any areas of major misclassification? Would you feel comfortable and confident passing along this map to someone who would then make “real world” decisions based off of it? In order to answer these questions (in your head…these are not actual graded questions), feel free to review the Google Satellite imagery with this classified map.
