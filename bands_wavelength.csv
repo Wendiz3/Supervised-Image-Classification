@@ -1,0 +1,7 @@
+band,wavelength
+blue,0.485
+green,0.56
+red,0.66
+nir,0.835
+swir1,1.65
+swir2,2.22
